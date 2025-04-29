@@ -19,6 +19,7 @@ on:
 
 jobs:
   render:
+    continue-on-error: true
     strategy:
       matrix:
         danser_version: [0.11.0, 0.10.0, 0.9.0]
@@ -141,7 +142,7 @@ jobs:
         run: |
           # Get release URL for the specified version
           DANSER_VERSION=${{ matrix.danser_version }}
-          RELEASE_URL=$(curl -s https://api.github.com/repos/Wieku/danser-go/releases/tags/v${DANSER_VERSION} | jq -r '.assets[] | select(.name | contains("linux")) | .browser_download_url')
+          RELEASE_URL=$(curl -s https://api.github.com/repos/Wieku/danser-go/releases/tags/${DANSER_VERSION} | jq -r '.assets[] | select(.name | contains("linux")) | .browser_download_url')
           echo "Downloading from: $RELEASE_URL"
           
           # Download and extract
