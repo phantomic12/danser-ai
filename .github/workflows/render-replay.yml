@@ -19,6 +19,9 @@ on:
 
 jobs:
   render:
+    strategy:
+      matrix:
+        danser_version: [0.11.0, 0.10.0, 0.9.0]
     runs-on: ubuntu-latest
     container:
       image: ubuntu:22.04
@@ -136,24 +139,25 @@ jobs:
       
       - name: Download and setup danser-go
         run: |
-          # Get latest release URL
-          LATEST_RELEASE_URL=$(curl -s https://api.github.com/repos/Wieku/danser-go/releases/latest | jq -r '.assets[] | select(.name | contains("linux")) | .browser_download_url')
-          echo "Downloading from: $LATEST_RELEASE_URL"
+          # Get release URL for the specified version
+          DANSER_VERSION=${{ matrix.danser_version }}
+          RELEASE_URL=$(curl -s https://api.github.com/repos/Wieku/danser-go/releases/tags/v${DANSER_VERSION} | jq -r '.assets[] | select(.name | contains("linux")) | .browser_download_url')
+          echo "Downloading from: $RELEASE_URL"
           
           # Download and extract
           mkdir -p danser
           cd danser
           
           # Download and extract based on file extension
-          if echo "$LATEST_RELEASE_URL" | grep -q "\.zip$"; then
-            curl -L -o danser.zip "$LATEST_RELEASE_URL"
+          if echo "$RELEASE_URL" | grep -q "\.zip$"; then
+            curl -L -o danser.zip "$RELEASE_URL"
             unzip danser.zip
-          elif echo "$LATEST_RELEASE_URL" | grep -q "\.tar\.gz$"; then
-            curl -L -o danser.tar.gz "$LATEST_RELEASE_URL"
+          elif echo "$RELEASE_URL" | grep -q "\.tar\.gz$"; then
+            curl -L -o danser.tar.gz "$RELEASE_URL"
             tar -xzf danser.tar.gz
           else
             echo "Unknown format, downloading as zip and trying both extraction methods"
-            curl -L -o danser.archive "$LATEST_RELEASE_URL"
+            curl -L -o danser.archive "$RELEASE_URL"
             unzip danser.archive || tar -xzf danser.archive || echo "Extraction failed, trying to continue"
           fi
           
@@ -173,9 +177,9 @@ jobs:
         env:
           OSU_API_KEY: ${{ secrets.OSU_API }}
         run: |
-          # Copy replay file to danser's Replays directory
-          cp /__w/danser-render-temp/danser-render-temp/${{ github.event.inputs.replayFile }} /root/.local/share/danser/Replays/
-          REPLAY_FILENAME=$(basename ${{ github.event.inputs.replayFile }})
+          # Copy replay file to danser's Replays directory using the correct workspace path
+          cp "${{ github.workspace }}/${{ github.event.inputs.replayFile }}" /root/.local/share/danser/Replays/
+          REPLAY_FILENAME=$(basename "${{ github.event.inputs.replayFile }}")
           echo "REPLAY_FILENAME=${REPLAY_FILENAME}" >> $GITHUB_ENV
           
           # Create Python script to extract beatmap_id and download it
