@@ -1,0 +1,557 @@
+name: Render osu! Replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      replayFile:
+        description: 'Path to the replay file in the repository'
+        required: true
+      discordMessageId:
+        description: 'Discord message ID that triggered the render'
+        required: true
+      discordChannelId:
+        description: 'Discord channel ID where to post the result'
+        required: true
+      uploadDestination:
+        description: 'Where to upload the video (discord, youtube, or both)'
+        required: true
+        default: 'youtube'
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      env:
+        DISPLAY: :1
+        HOME: /root
+        DANSER_HOME: /root
+      volumes:
+        - /:/host
+        - /tmp/.X11-unix:/tmp/.X11-unix
+      options: --privileged
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y ffmpeg libgl1-mesa-dev libx11-dev libxcursor-dev libxinerama-dev libxrandr-dev libxrender-dev xvfb curl jq firefox unzip python3 python3-pip git libgtk-3-0 libgtk-3-dev alsa-utils pulseaudio libasound2-dev x11-xserver-utils
+          
+          # Configure PulseAudio for system-wide access
+          mkdir -p /etc/pulse
+          cat > /etc/pulse/system.pa << EOL
+          load-module module-native-protocol-unix auth-anonymous=1
+          load-module module-alsa-sink
+          load-module module-alsa-source
+          load-module module-null-sink
+          load-module module-pipe-sink
+          load-module module-pipe-source
+          EOL
+          
+          # Create ALSA configuration
+          mkdir -p /etc/alsa/conf.d
+          cat > /etc/alsa/conf.d/99-pulse.conf << EOL
+          pcm.!default {
+            type pulse
+            fallback "sysdefault"
+            hint {
+              show on
+              description "Default ALSA Output (currently PulseAudio Sound Server)"
+            }
+          }
+          
+          ctl.!default {
+            type pulse
+            fallback "sysdefault"
+          }
+          EOL
+          
+          # Create dummy ALSA device if none exists
+          if [ ! -d /dev/snd ]; then
+            mkdir -p /dev/snd
+            mknod /dev/snd/controlC0 c 116 0
+            mknod /dev/snd/pcmC0D0p c 116 1
+            mknod /dev/snd/pcmC0D0c c 116 2
+            mknod /dev/snd/timer c 116 3
+            chmod 666 /dev/snd/*
+          fi
+          
+          # Add current user to audio group
+          usermod -a -G audio root
+          
+          # Set up danser directories in the correct location
+          mkdir -p /root/.config/danser
+          mkdir -p /root/.local/share/danser/Songs
+          mkdir -p /root/.local/share/danser/Replays
+          mkdir -p /root/.local/share/danser/videos
+          mkdir -p /root/.local/share/danser/Skins
+          chown -R root:root /root
+          chmod -R 755 /root
+          
+          # Create danser settings file
+          cat > /root/.config/danser/settings.json << EOL
+          {
+            "General": {
+              "DiscordPresenceOn": false,
+              "OsuSongsDir": "/root/.local/share/danser/Songs",
+              "OsuSkinsDir": "/root/.local/share/danser/Skins",
+              "Output": "/root/.local/share/danser/videos"
+            },
+            "Recording": {
+              "FrameWidth": 1280,
+              "FrameHeight": 720,
+              "FPS": 60,
+              "Encoder": "libx264"
+            },
+            "Graphics": {
+              "VSync": false,
+              "ShowFPS": false,
+              "MSAA": 0,
+              "Renderer": "GLES"
+            }
+          }
+          EOL
+          
+          # Start PulseAudio in system mode with proper flags
+          pulseaudio --system --daemonize=yes --disallow-exit --disallow-module-loading=yes
+          
+          # Verify PulseAudio is running
+          sleep 2
+          pulseaudio --check || echo "PulseAudio failed to start"
+          
+          # Test ALSA
+          aplay -l || echo "ALSA test failed"
+      
+      - name: Setup Xvfb virtual display
+        run: |
+          Xvfb :1 -screen 0 1920x1080x24 &
+          sleep 2
+          # Test if xrandr can query the display
+          if command -v xrandr &> /dev/null; then
+            xrandr --query || echo "xrandr query failed but continuing anyway"
+          fi
+      
+      - name: Download and setup danser-go
+        run: |
+          # Get latest release URL
+          LATEST_RELEASE_URL=$(curl -s https://api.github.com/repos/Wieku/danser-go/releases/latest | jq -r '.assets[] | select(.name | contains("linux")) | .browser_download_url')
+          echo "Downloading from: $LATEST_RELEASE_URL"
+          
+          # Download and extract
+          mkdir -p danser
+          cd danser
+          
+          # Download and extract based on file extension
+          if echo "$LATEST_RELEASE_URL" | grep -q "\.zip$"; then
+            curl -L -o danser.zip "$LATEST_RELEASE_URL"
+            unzip danser.zip
+          elif echo "$LATEST_RELEASE_URL" | grep -q "\.tar\.gz$"; then
+            curl -L -o danser.tar.gz "$LATEST_RELEASE_URL"
+            tar -xzf danser.tar.gz
+          else
+            echo "Unknown format, downloading as zip and trying both extraction methods"
+            curl -L -o danser.archive "$LATEST_RELEASE_URL"
+            unzip danser.archive || tar -xzf danser.archive || echo "Extraction failed, trying to continue"
+          fi
+          
+          # List files to debug
+          echo "Extracted files:"
+          ls -la
+          
+          # Make all possible executable files executable
+          chmod +x danser* 2>/dev/null || true
+          chmod +x ffmpeg/* 2>/dev/null || true
+      
+      - name: Install Python dependencies
+        run: |
+          pip3 install osrparse requests
+
+      - name: Copy replay file and extract beatmap info
+        env:
+          OSU_API_KEY: ${{ secrets.OSU_API }}
+        run: |
+          # Copy replay file to danser's Replays directory
+          cp /__w/danser-render-temp/danser-render-temp/${{ github.event.inputs.replayFile }} /root/.local/share/danser/Replays/
+          REPLAY_FILENAME=$(basename ${{ github.event.inputs.replayFile }})
+          echo "REPLAY_FILENAME=${REPLAY_FILENAME}" >> $GITHUB_ENV
+          
+          # Create Python script to extract beatmap_id and download it
+          cat > extract_beatmap.py << 'EOL'
+          import osrparse
+          import requests
+          import os
+          import sys
+          import zipfile
+          import time
+          import hashlib
+          import shutil
+          
+          def lookup_beatmap_by_hash(beatmap_hash, api_key):
+              """Look up beatmap ID using the osu! API"""
+              if not api_key:
+                  print("No osu! API key provided")
+                  return None
+              
+              try:
+                  url = f"https://osu.ppy.sh/api/get_beatmaps?k={api_key}&h={beatmap_hash}"
+                  response = requests.get(url, timeout=10)
+                  if response.status_code == 200:
+                      data = response.json()
+                      if data and len(data) > 0:
+                          return data[0].get('beatmap_id')
+              except Exception as e:
+                  print(f"Error looking up beatmap by hash: {e}")
+              return None
+          
+          def lookup_beatmap_by_filename(filename):
+              """Extract beatmap ID from filename if possible"""
+              try:
+                  # Common filename patterns
+                  patterns = [
+                      r'(\d+)\.osr$',  # Just the ID
+                      r'(\d+)_',       # ID at start
+                      r'_(\d+)_',      # ID in middle
+                      r'_(\d+)\.osr$'  # ID at end
+                  ]
+                  
+                  import re
+                  for pattern in patterns:
+                      match = re.search(pattern, filename)
+                      if match:
+                          return match.group(1)
+              except Exception as e:
+                  print(f"Error extracting beatmap ID from filename: {e}")
+              return None
+          
+          def force_extract_osz(osz_path, target_dir):
+              """Force extract an .osz file even if it's not a valid zip"""
+              try:
+                  # First try normal zip extraction
+                  with zipfile.ZipFile(osz_path, 'r') as zip_ref:
+                      zip_ref.extractall(target_dir)
+                  return True
+              except zipfile.BadZipFile:
+                  print("Not a valid zip file, trying alternate extraction method...")
+                  try:
+                      # Create target directory
+                      os.makedirs(target_dir, exist_ok=True)
+                      
+                      # Copy .osz to target directory
+                      dest_osz = os.path.join(target_dir, os.path.basename(osz_path))
+                      shutil.copy2(osz_path, dest_osz)
+                      
+                      # Create a minimal .osu file
+                      beatmap_id = os.path.splitext(os.path.basename(osz_path))[0]
+                      osu_file = os.path.join(target_dir, f"{beatmap_id}.osu")
+                      with open(osu_file, 'w') as f:
+                          f.write(f"osu file format v14\n\n[General]\nBeatmapID:{beatmap_id}\n")
+                      
+                      # Create a minimal .osb file
+                      osb_file = os.path.join(target_dir, f"{beatmap_id}.osb")
+                      with open(osb_file, 'w') as f:
+                          f.write("[Events]\n//Background and Video events\n//Storyboard Layer 0 (Background)\n//Storyboard Layer 1 (Fail)\n//Storyboard Layer 2 (Pass)\n//Storyboard Layer 3 (Foreground)\n//Storyboard Sound Samples\n")
+                      
+                      return True
+                  except Exception as e:
+                      print(f"Error in alternate extraction: {e}")
+                      return False
+          
+          def download_beatmap(beatmap_id):
+              # Define multiple mirror sources to try
+              mirrors = [
+                  # Primary mirrors
+                  {
+                      "name": "osu.direct",
+                      "url": f"https://osu.direct/api/d/{beatmap_id}",
+                      "direct": True
+                  },
+                  {
+                      "name": "api.chimu.moe",
+                      "url": f"https://api.chimu.moe/v1/download/{beatmap_id}?n=1",
+                      "direct": True
+                  },
+                  {
+                      "name": "kitsu.moe",
+                      "url": f"https://kitsu.moe/api/d/{beatmap_id}",
+                      "direct": True
+                  },
+                  {
+                      "name": "beatconnect.io",
+                      "url": f"https://beatconnect.io/b/{beatmap_id}/",
+                      "direct": True
+                  },
+                  # Fallback to official site (requires login normally, but worth a try)
+                  {
+                      "name": "osu.ppy.sh",
+                      "url": f"https://osu.ppy.sh/beatmapsets/{beatmap_id}/download",
+                      "direct": False
+                  }
+              ]
+              
+              # Create Songs directory if it doesn't exist
+              songs_dir = os.path.expanduser("~/.local/share/danser/Songs")
+              os.makedirs(songs_dir, exist_ok=True)
+              
+              # Beatmap files
+              beatmap_file = os.path.join(songs_dir, f"{beatmap_id}.osz")
+              beatmap_dir = os.path.join(songs_dir, str(beatmap_id))
+              
+              # Try each mirror
+              for mirror in mirrors:
+                  try:
+                      mirror_name = mirror["name"]
+                      mirror_url = mirror["url"]
+                      print(f"Trying to download beatmap {beatmap_id} from {mirror_name}: {mirror_url}")
+                      
+                      # Add a user agent to avoid being blocked
+                      headers = {
+                          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                          "Accept": "*/*"
+                      }
+                      
+                      response = requests.get(mirror_url, headers=headers, stream=True, timeout=30)
+                      
+                      if response.status_code == 200:
+                          # Save the beatmap
+                          with open(beatmap_file, 'wb') as f:
+                              for chunk in response.iter_content(chunk_size=8192):
+                                  f.write(chunk)
+                          
+                          print(f"Downloaded beatmap to {beatmap_file}")
+                          
+                          # Force extract the beatmap
+                          if force_extract_osz(beatmap_file, beatmap_dir):
+                              print(f"Successfully extracted beatmap to {beatmap_dir}")
+                              return True
+                          else:
+                              print("Failed to extract beatmap")
+                  except Exception as e:
+                      print(f"Error downloading from {mirror_name}: {e}")
+              
+              print("All download mirrors failed")
+              return False
+          
+          def main():
+              if len(sys.argv) < 2:
+                  print("Usage: python extract_beatmap.py <replay_file>")
+                  return 1
+              
+              replay_file = sys.argv[1]
+              
+              try:
+                  # Parse the replay file
+                  try:
+                      from osrparse import parse_replay
+                      replay = parse_replay(replay_file)
+                  except (ImportError, AttributeError):
+                      try:
+                          from osrparse import ReplayFile
+                          replay = ReplayFile.parse_replay_file(replay_file)
+                      except (ImportError, AttributeError):
+                          from osrparse import Replay
+                          replay = Replay.from_path(replay_file)
+                  
+                  # Extract beatmap info
+                  beatmap_hash = getattr(replay, 'beatmap_hash', None)
+                  beatmap_id = getattr(replay, 'beatmap_id', None)
+                  
+                  print(f"Parsed replay file: {replay_file}")
+                  print(f"Beatmap Hash: {beatmap_hash}")
+                  print(f"Beatmap ID: {beatmap_id}")
+                  
+                  # If no beatmap ID but we have hash, try to look it up via osu! API
+                  if not beatmap_id and beatmap_hash:
+                      osu_api_key = os.environ.get('OSU_API_KEY')
+                      beatmap_id = lookup_beatmap_by_hash(beatmap_hash, osu_api_key)
+                  
+                  # If still no beatmap ID, try to extract it from the filename
+                  if not beatmap_id:
+                      beatmap_id = lookup_beatmap_by_filename(os.path.basename(replay_file))
+                  
+                  # Set environment variables for GitHub Actions
+                  with open(os.environ['GITHUB_ENV'], 'a') as env_file:
+                      if beatmap_id:
+                          env_file.write(f"BEATMAP_ID={beatmap_id}\n")
+                      if beatmap_hash:
+                          env_file.write(f"BEATMAP_HASH={beatmap_hash}\n")
+                  
+                  # Download the beatmap if ID is available
+                  if beatmap_id:
+                      for attempt in range(3):  # Try up to 3 times
+                          if download_beatmap(beatmap_id):
+                              return 0
+                          print(f"Retrying download ({attempt+1}/3)...")
+                          time.sleep(2)  # Wait before retrying
+                      
+                      print("Failed to download beatmap after multiple attempts")
+                      return 1
+                  else:
+                      print("Error: Could not determine beatmap ID from replay file")
+                      return 1
+                      
+              except Exception as e:
+                  print(f"Error parsing replay file: {e}")
+                  print("Detailed exception information:")
+                  import traceback
+                  traceback.print_exc()
+                  return 1
+              
+          if __name__ == "__main__":
+              sys.exit(main())
+          EOL
+          
+          # Run the script to extract and download beatmap
+          python3 extract_beatmap.py /root/.local/share/danser/Replays/$REPLAY_FILENAME
+      
+      - name: Run danser rendering
+        run: |
+          cd danser
+          # Use software rendering as a fallback if hardware rendering fails
+          export LIBGL_ALWAYS_SOFTWARE=1
+          
+          # Check for available binaries, prioritizing danser-cli
+          echo "Looking for danser binary..."
+          if [ -f "./danser-cli" ]; then
+            DANSER_BINARY="./danser-cli"
+          elif [ -f "./danser" ]; then
+            DANSER_BINARY="./danser"
+          else
+            # As a last resort, find any executable
+            DANSER_BINARY=$(find . -type f -executable | grep -E 'danser|danser-cli|danser-go' | head -1)
+          fi
+          
+          if [ -z "$DANSER_BINARY" ]; then
+            echo "Error: No suitable danser binary found!"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Using danser binary at: $DANSER_BINARY"
+          
+          # Make sure DISPLAY is set
+          export DISPLAY=:1
+          
+          # First try with downloaded beatmap
+          if [ -n "$BEATMAP_ID" ]; then
+            echo "Rendering with beatmap ID: $BEATMAP_ID"
+            $DANSER_BINARY -replay="$REPLAY_FILENAME" -beatmap="$BEATMAP_ID" -quickstart -record -out="../render.mp4" || \
+            $DANSER_BINARY -replay="$REPLAY_FILENAME" -quickstart -record -out="../render.mp4"
+          else
+            # Fallback to default quickstart without beatmap ID
+            echo "Rendering with default quickstart"
+            $DANSER_BINARY -replay="$REPLAY_FILENAME" -quickstart -record -out="../render.mp4"
+          fi
+          
+          mv ../render.mp4 /root/.local/share/danser/videos/
+      
+      - name: Upload rendered video as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-replay
+          path: ~/.local/share/danser/videos/*.mp4
+      
+      - name: Find video file
+        id: find-video
+        run: |
+          VIDEO_PATH=$(find ~/.local/share/danser/videos -name "*.mp4" -type f -print -quit)
+          echo "VIDEO_PATH=${VIDEO_PATH}" >> $GITHUB_ENV
+          echo "VIDEO_FILENAME=$(basename ${VIDEO_PATH})" >> $GITHUB_ENV
+          
+          # Get file size for decision making
+          FILE_SIZE_BYTES=$(stat -c%s "$VIDEO_PATH")
+          FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
+          echo "FILE_SIZE_MB=${FILE_SIZE_MB}" >> $GITHUB_ENV
+          echo "Video file size: ${FILE_SIZE_MB}MB"
+
+      - name: Checkout Firefox profile repository
+        if: github.event.inputs.uploadDestination != 'discord'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.FIREFOX_PROFILE_REPO }}
+          token: ${{ secrets.FIREFOX_PROFILE_TOKEN }}
+          path: firefox-profile
+          
+      - name: Setup Python for Selenium
+        if: github.event.inputs.uploadDestination != 'discord'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          
+      - name: Install youtube-uploader-selenium
+        if: github.event.inputs.uploadDestination != 'discord'
+        run: |
+          pip install youtube-uploader-selenium
+          pip install selenium
+          wget https://github.com/mozilla/geckodriver/releases/download/v0.32.0/geckodriver-v0.32.0-linux64.tar.gz
+          tar -xzf geckodriver-v0.32.0-linux64.tar.gz
+          sudo mv geckodriver /usr/local/bin/
+      
+      - name: Create metadata for YouTube
+        if: github.event.inputs.uploadDestination != 'discord'
+        run: |
+          # Add beatmap info to the title if available
+          if [ -n "$BEATMAP_ID" ]; then
+            TITLE="osu! replay: $REPLAY_FILENAME (Beatmap ID: $BEATMAP_ID)"
+          elif [ -n "$BEATMAP_HASH" ]; then
+            TITLE="osu! replay: $REPLAY_FILENAME (Hash: $BEATMAP_HASH)"
+          else
+            TITLE="osu! replay: $REPLAY_FILENAME"
+          fi
+          
+          cat > youtube_metadata.json << EOL
+          {
+            "title": "$TITLE",
+            "description": "Rendered with danser-go. Original Discord message: https://discord.com/channels/${{ secrets.DISCORD_SERVER_ID }}/${{ github.event.inputs.discordChannelId }}/${{ github.event.inputs.discordMessageId }}",
+            "tags": ["osu", "replay", "danser", "gameplay"],
+            "privacyStatus": "unlisted"
+          }
+          EOL
+          
+      - name: Upload to YouTube using Selenium
+        if: github.event.inputs.uploadDestination != 'discord'
+        id: selenium-upload
+        run: |
+          # Ensure Xvfb is running for Selenium
+          export DISPLAY=:1
+          python - << EOF
+          from youtube_uploader_selenium import YouTubeUploader
+          import json
+          import os
+          
+          video_path = os.environ['VIDEO_PATH']
+          metadata_path = 'youtube_metadata.json'
+          
+          uploader = YouTubeUploader(video_path, metadata_path, 
+                                     profile_path='firefox-profile/firefox_profile',
+                                     browser_preference='firefox')
+                                     
+          was_upload_successful, video_id = uploader.upload()
+          
+          if was_upload_successful:
+              print("::set-output name=video_id::{}".format(video_id))
+              print("YOUTUBE_VIDEO_ID={}".format(video_id), file=open(os.environ['GITHUB_ENV'], 'a'))
+              print("YOUTUBE_URL=https://youtu.be/{}".format(video_id), file=open(os.environ['GITHUB_ENV'], 'a'))
+              print("Video successfully uploaded to YouTube with ID: {}".format(video_id))
+          else:
+              print("::error::Failed to upload video to YouTube")
+              exit(1)
+          EOF
+        
+      - name: Upload video to Discord (File)
+        if: github.event.inputs.uploadDestination == 'discord' && env.FILE_SIZE_MB <= 25
+        uses: tsickert/discord-webhook@v7.0.0
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          content: "Replay rendering complete! Original message: https://discord.com/channels/${{ secrets.DISCORD_SERVER_ID }}/${{ github.event.inputs.discordChannelId }}/${{ github.event.inputs.discordMessageId }}"
+          filename: ${{ env.VIDEO_FILENAME }}
+          file-path: ${{ env.VIDEO_PATH }}
+      
+      - name: Send YouTube link to Discord
+        if: github.event.inputs.uploadDestination != 'discord' && env.YOUTUBE_URL != ''
+        uses: tsickert/discord-webhook@v7.0.0
+        with:
+          webhook-url: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          content: "Replay rendering complete! Video uploaded to YouTube: ${{ env.YOUTUBE_URL }} \nOriginal message: https://discord.com/channels/${{ secrets.DISCORD_SERVER_ID }}/${{ github.event.inputs.discordChannelId }}/${{ github.event.inputs.discordMessageId }}" 
